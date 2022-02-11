@@ -1,0 +1,589 @@
+---
+title: "Predicting Ultra Marathon Times"
+subtitle: "DS49 Final Project"
+author: "James Adams"
+filters:
+  - _resources/scripts/shortcodes.lua
+standalone: true
+self-contained: true
+jupyter: python3
+format:
+  revealjs:
+    theme: _resources/templates/slide-theme.scss
+    transition: slide
+    margin: 0.2
+    smaller: false
+    # code-overflow: wrap
+	slide-level: 2
+---
+
+```{python}
+import math
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.figure import figaspect
+
+# model requirements
+from sklearn import metrics
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import cross_validate
+from sklearn.model_selection import KFold
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.dummy import DummyRegressor
+
+# some models were throwing warnings, suppress them
+import warnings
+warnings.filterwarnings(action='ignore')
+
+# plot formatting
+sns.set_theme(style='white', palette='muted', font='sans-serif', font_scale=1.5)
+plt.rcParams['figure.facecolor'] = '#FFF8E7'
+plt.rcParams['axes.facecolor'] = '#FFF'
+# specify a custom font and properties for axes
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = 'Inter'
+plt.rcParams['axes.labelcolor'] = '#991410'
+plt.rcParams['axes.labelweight'] = 'bold'
+plt.rcParams['axes.labelpad'] = 15
+plt.rcParams['figure.figsize'] = (12,6)
+
+# read in data
+detailed_results = pd.read_csv('data/detailed_results.csv').drop(columns='Unnamed: 0')
+feature_scores = pd.read_csv('data/feature_scores.csv')
+
+# set decimal places
+pd.set_option("display.precision", 2)
+pd.set_option('display.float_format', lambda x: '%.2f' % x)
+```
+
+# Background
+
+::: footer
+[◂ Back to Technical Notebook](02-Technical-Notebook.html)
+:::
+
+## Ultra marathons
+
+- An ultramarathon is any race longer than the normal marathon length of ~42 kilometres (~26 miles)
+- 50k and 100k are both World Athletics record distances, but some 100 miles (160 km) races are among the oldest and most prestigious events
+- Around 100 miles is typically the longest course distance raced in under 24 hours
+
+## Participation
+
+```{python}
+participation_by_year = detailed_results[['year', 'participants']].groupby('year').sum().reset_index()
+
+fig, ax = plt.subplots()
+sns.barplot(data=participation_by_year, x='year', y='participants', ax=ax)
+ax.set_xlabel('Year')
+ax.set_ylabel('Total participants')
+plt.show()
+```
+
+## Dataset
+
+- 'Ultra Trail Running' dataset from the [TidyTuesday project](https://github.com/rfordatascience/tidytuesday/blob/master/data/2021/2021-10-26/readme.md)
+- ...which was itself compiled from data made available by the [International Trail Running Associate (ITRA)](https://itra.run/Races/FindRaceResults)
+- Covers the results of 100 mile trail running races from 2012 to 2021, with both race and runner characteristics recorded
+
+## Data cleaning
+
+- Data contained a lot of `NaNs`
+- Some were just straight up missing, or data entry errors - e.g. runner age of 0 or 133 years!
+- Investigated and filled or dropped as appropriate, e.g. using `groupby` on `race_year_id` to count and fill in missing participation numbers:
+
+```python
+zero_participant_races = races[races.participants == 0].race_year_id.unique()
+
+participant_counts = dict(rankings[rankings.race_year_id.isin(zero_participant_races)].groupby('race_year_id').runner.count())
+
+for k, v in participant_counts.items():
+    detailed_results['participants'].where(~(detailed_results.race_year_id == k), other=v, inplace=True)
+```
+
+## DNFs
+
+- A lot were missing time values from runners that did not finish (*DNF*)
+- DNFs were split from the main data and stored in a separate dataset for possible secondary analysis
+
+```python
+dnf = runners[runners['time_in_seconds'].isna()].copy()
+results = runners[runners['time_in_seconds'].notna()].copy()
+```
+
+## Problem statement
+
+<br><br>
+
+:::{.r-fit-text}
+**Can you predict the finishing time of a**  
+**given athlete profile for a given race?**
+:::
+
+## Variables: runner gender
+
+```{python}
+annual_times_by_gender = pd.DataFrame(((detailed_results.groupby(['gender', 'year']).time_in_seconds.mean() / 60) / 60)).reset_index()
+
+fig, ax = plt.subplots()
+sns.lineplot(data=annual_times_by_gender, x='year', y='time_in_seconds', hue='gender', ax=ax, linewidth=3)
+ax.set_ylim(31, 36)
+ax.set_xlabel('Year')
+ax.set_ylabel('Mean finishing time (hours)')
+ax.legend(title='Gender')
+plt.show()
+```
+
+## Variables: runner age
+
+```{python}
+age_groups = detailed_results[['year', 'gender', 'age', 'time_in_seconds']].copy()
+age_groups['time_in_hours'] = round(((age_groups.time_in_seconds / 60) / 60), 2)
+
+def age_group(x):
+    y = int(np.ceil(x / float(10))) * 10
+    if y == 20:
+        return '17 - 20'
+    else:
+        z = str((y - 10) + 1)
+        return z + ' - ' + str(y)
+
+age_groups['age_group'] = age_groups.age.apply(age_group)
+
+mean_times_by_age = age_groups.groupby(['year', 'age_group']).mean().reset_index()
+
+fig, ax = plt.subplots()
+sns.lineplot(data=mean_times_by_age, x='year', y='time_in_hours', hue='age_group', ax=ax, linewidth=3)
+ax.set_xlabel('Year')
+ax.set_ylabel('Mean finishing time (hrs)')
+ax.legend(bbox_to_anchor=(0.8, 0.96), loc='upper left', borderaxespad=0)
+plt.show()
+```
+
+## Variables: runner nationality
+
+```{python}
+x = detailed_results[detailed_results['rank'] == 1.0].groupby(['year', 'nationality']).size()
+
+won_by_year = pd.DataFrame(x).reset_index().rename(columns={0: 'size'}).sort_values(['year', 'size'], ascending=False).groupby('year').head(5)
+
+fig, ax = plt.subplots()
+sns.barplot(data=won_by_year, x='year', y='size', hue='nationality', ax=ax)
+ax.set_xlabel('Year')
+ax.set_ylabel('No. of wins')
+ax.legend(bbox_to_anchor=(0.83, 0.96), loc='upper left', borderaxespad=0)
+plt.show()
+```
+
+## Variables: race characteristics
+
+```{python}
+detailed_results[['city', 'distance', 'elevation_gain', 'elevation_loss',
+                'aid_stations', 'participants']].head(5)
+```
+
+# Regression model
+
+## Dummy encoding
+
+- Categorical features needed encoding to work with regression
+
+:::{.panel-tabset}
+### Code
+
+```{.python}
+data_dm = pd.get_dummies(data, drop_first=True)
+```
+
+### Result
+
+```{python}
+data = detailed_results[['time_in_seconds', 'age', 'gender', 'nationality',
+                'city', 'distance', 'elevation_gain', 'elevation_loss',
+                'aid_stations', 'participants']]
+data_dm = pd.get_dummies(data, drop_first=True)
+
+data_dm.rename(columns={"time_in_seconds": "time",
+                        "age": "runner_age",
+                        "gender_W": "runner_gender"},
+               inplace=True)
+data_dm.rename(columns=lambda x: x.replace("nationality", "runner_nationality"), inplace=True)
+
+data_dm.head(5)
+```
+:::
+
+## Test/train split & Cross validation
+
+- Instantiating a KFold and LinearRegression object
+- Using `cross_validate` with the training data to obtain model metrics
+
+:::{.panel-tabset}
+### Code
+
+```python
+X = data_dm.drop(columns='time')
+y = data_dm.time
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=2022)
+
+lr = LinearRegression()
+kf = KFold(n_splits=5, shuffle=True, random_state=2022)
+
+val_scores = cross_validate(lr, X_train, y_train, cv=kf, scoring=('r2', 'neg_mean_squared_error'), return_train_score=True)
+```
+
+### Result
+
+```{python}
+X = data_dm.drop(columns='time')
+y = data_dm.time
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=2022)
+
+lr = LinearRegression()
+kf = KFold(n_splits=5, shuffle=True, random_state=2022)
+
+val_scores = cross_validate(lr, X_train, y_train, cv=kf, scoring=('r2', 'neg_mean_squared_error'), return_train_score=True)
+
+print(f"""
+  ----- Cross Validation Results -----
+  Train RMSE: {np.sqrt(-val_scores['train_neg_mean_squared_error']).mean()}
+  Train RMSE as hours: {np.sqrt(-val_scores['train_neg_mean_squared_error']).mean()/3600}
+  Train R2: {val_scores['train_r2'].mean()}
+  Test RMSE: {np.sqrt(-val_scores['test_neg_mean_squared_error']).mean()}
+  Test RMSE as hours: {np.sqrt(-val_scores['test_neg_mean_squared_error']).mean()/3600}
+  Test R2: {val_scores['test_r2'].mean()}
+  -------------------------------------
+""")
+```
+:::
+
+## Feature reduction
+
+- As there are so many features in the data as a result of the dummy encoding, it may not be practical to investigate their impact on the model manually by inspecting coefficients
+- It would be a shame to potentially lose the information contained in the categorical variables
+- So I decided to investigate an automated way to see how many and which variables should be included
+
+## SelectKBest pipeline
+
+- Using a scikit-learn pipeline and `SelectKBest` to find the best variables to include in our model
+- Took a while!
+
+```python
+# create dictionaries to store results
+scores = {}
+rmses = {}
+
+# loop through all the possible numbers of variables included in the model,
+# fit each one using a pipeline with SelectKBest and a Linear Regression model,
+# and store the results in the dictionaries
+for n in range(1, 430):
+	lr_selected = make_pipeline(SelectKBest(f_regression, k=n), LinearRegression())
+	lr_selected.fit(X_train, y_train)
+	score = lr_selected.score(X_test, y_test)
+	scores[str(n)] = score
+	rmse = np.sqrt(metrics.mean_squared_error(y_test, lr_selected.predict(X_test)))
+	rmses[str(n)] = rmse
+```
+
+## SelectKBest results
+
+- 406 variables wins!
+
+```{python}
+r2_vals = feature_scores.r2[feature_scores.r2 > 0.5]
+rmse_vals = feature_scores.rmse[feature_scores.r2 > 0.5]
+x_vals = feature_scores[feature_scores.r2 > 0.5].index.astype(int)
+
+# plot the results of the feature selection
+fig, ax1 = plt.subplots(figsize=figaspect(.6))
+
+ax2 = ax1.twinx()
+sns.lineplot(x_vals, r2_vals, ax=ax1, label='R2', color='#309FC9', linewidth=3, legend=False)
+sns.lineplot(x_vals, rmse_vals, ax=ax2, label='RMSE', color='#149910', linewidth=3, legend=False)
+
+ax1.set_xlabel('No. of Features')
+ax1.set_ylabel('R2', color='#309FC9')
+ax2.set_ylabel('RMSE', color='#149910')
+
+plt.show()
+```
+
+## Model
+
+- Now the new model can be cross-validated, trained, and tested on the holdout testing data
+
+:::{.panel-tabset}
+### Code
+
+```python
+lr_model = make_pipeline(SelectKBest(f_regression, k=406), LinearRegression())
+
+new_val_scores = cross_validate(lr_model, X_train, y_train, cv=kf, scoring=('r2', 'neg_mean_squared_error'), return_train_score=True)
+
+lr_model.fit(X_train, y_train)
+
+# Calculate R2
+lr_model.score(X_test, y_test)
+# Calculate RMSE
+np.sqrt(metrics.mean_squared_error(y_test, lr_model.predict(X_test)))
+```
+
+### Cross-validation
+
+```{python}
+# re-check cross-validation for 406 features
+lr_model = make_pipeline(SelectKBest(f_regression, k=406), LinearRegression())
+
+# perform cross validation
+new_val_scores = cross_validate(lr_model, X_train, y_train, cv=kf, scoring=('r2', 'neg_mean_squared_error'), return_train_score=True)
+
+lr_model.fit(X_train, y_train)
+
+print(f"""
+  ----- Cross Validation Results -----
+  Train RMSE: {np.sqrt(-new_val_scores['train_neg_mean_squared_error']).mean()}
+  Train RMSE as hours: {np.sqrt(-new_val_scores['train_neg_mean_squared_error']).mean()/3600}
+  Train R2: {new_val_scores['train_r2'].mean()}
+  Test RMSE: {np.sqrt(-new_val_scores['test_neg_mean_squared_error']).mean()}
+  Test RMSE as hours: {np.sqrt(-new_val_scores['test_neg_mean_squared_error']).mean()/3600}
+  Test R2: {new_val_scores['test_r2'].mean()}
+  -------------------------------------
+""")
+```
+
+### Testing
+
+```{python}
+print(f"""
+  ----- Final Model Results -----
+  R2: {round(lr_model.score(X_test, y_test), 2)}
+  RMSE: {round(np.sqrt(metrics.mean_squared_error(y_test, lr_model.predict(X_test))), 2)}
+  RMSE in hrs: {round(np.sqrt(metrics.mean_squared_error(y_test, lr_model.predict(X_test))) / 3600, 2)}
+  -------------------------------
+""")
+```
+:::
+
+## Compare to baseline
+
+- ~5 hours may be quite a wide margin for a race result - does our final model, at the very least, beat a baseline model that is just guessing with the mean?
+
+:::{.panel-tabset}
+### Code
+
+```python
+lr_dummy = make_pipeline(SelectKBest(f_regression, k=406), DummyRegressor(strategy='mean'))
+lr_dummy.fit(X_train, y_train)
+```
+
+### Result
+
+```{python}
+lr_dummy = make_pipeline(SelectKBest(f_regression, k=406), DummyRegressor(strategy='mean'))
+lr_dummy.fit(X_train, y_train)
+
+print(f"""
+  ----- Dummy Model Results -----
+  Dummy R2:{round(lr_dummy.score(X_test, y_test), 2)}
+  Dummy RMSE: {round(np.sqrt(metrics.mean_squared_error(y_test, lr_dummy.predict(X_test))), 2)}
+  Dummy RMSE in hrs: {round(np.sqrt(metrics.mean_squared_error(y_test, lr_dummy.predict(X_test))) / 3600, 2)}
+  -------------------------------
+""")
+```
+:::
+
+## Making predictions
+
+- With all the dummy variables in the model, it would be difficult to manually enter an encoded set of data to specify an athletes nationality or a race location
+- So I created a helper function that can be used to enter new data for predictions:
+
+:::{.panel-tabset}
+### Code
+
+```python
+predict_new_runner(20, 0, "GBR", 155, 1000, 400, 10, 100, "Zagreb")
+```
+
+### Result
+
+```{python}
+# function to enter new data and get predicted finishing time back in human readable format
+def predict_new_runner(age, gender, nat, distance, elevation_gain, elevation_loss, aid_stations, participants, city):
+	# create a dataframe with a single row and the same feature column names,
+	# but populated only by zeroes
+	base = pd.DataFrame(np.zeros((1, len(X_train.columns)), dtype=np.int64), columns=X_train.columns)
+
+	# set the values of the dataframe columns to the input values
+	base.runner_age = age
+	base.runner_gender = gender
+	base.distance = distance
+	base.elevation_gain = elevation_gain
+	base.elevation_loss = elevation_loss
+	base.aid_stations = aid_stations
+	base.participants = participants
+	# check if the given nationality and city are already in the
+	# feature cols and encode if so, otherwise skip
+	nat_col = "runner_nationality_" + nat
+	if (nat_col in base.columns):
+		base[nat_col] = 1
+	city_col = "city_" + city
+	if (city_col in base.columns):
+		base[city_col] = 1
+
+	# feed the new data to the model
+	s = float(lr_model.predict(base))
+
+	# assign a label to the gender data for nicer printing
+	if (gender == 0): 
+		gender_label = 'male'
+	else:
+		gender_label = 'female'
+
+	# workout total elevation change
+	if ((elevation_gain - elevation_loss) > 0): 
+		elevation_label = 'gain'
+	else:
+		elevation_label = 'loss'
+
+	print(f"""
+	----- Predicted Outcome -----
+	For a {age} year old {gender_label} from {nat}, running a {distance} km race in {city}
+	with an elevation {elevation_label} of {abs(elevation_gain - elevation_loss)} ft, {participants} other runners, and {aid_stations} aid stations.
+	
+	Predicted finishing time: {pd.to_timedelta(s, unit='s')}
+	-----------------------------
+	""")
+
+predict_new_runner(20, 0, "GBR", 155, 1000, 400, 10, 100, "Zagreb")
+```
+:::
+
+# Bonus
+
+## Ridge Regression
+
+- After going through all of the previous steps, I discovered that using Ridge Regression seemed to solve the issue with testing R2 without the need to use `SelectKBest`
+
+:::{.panel-tabset}
+### Code
+
+```python
+from sklearn.linear_model import Ridge
+
+# instantiate Ridge Regression object
+rdg = Ridge()
+
+# perform cross validation for Ridge Regression model
+rdg_val_scores = cross_validate(rdg, X_train, y_train, cv=kf, scoring=('r2', 'neg_mean_squared_error'), return_train_score=True)
+
+# fit and score model
+rdg.fit(X_train, y_train)
+rdg.score(X_test, y_test)
+
+# enter new data for a prediction from Ridge model
+rdg_predict_new_runner(20, 0, "GBR", 155, 1000, 400, 10, 100, "Zagreb")
+```
+
+### Result
+
+```{python}
+from sklearn.linear_model import Ridge
+
+# instantiate Ridge Regression object
+rdg = Ridge()
+
+# perform cross validation for Ridge Regression model
+rdg_val_scores = cross_validate(rdg, X_train, y_train, cv=kf, scoring=('r2', 'neg_mean_squared_error'), return_train_score=True)
+
+rdg.fit(X_train, y_train)
+
+print(f"""
+  ----- Cross Validation Results -----
+  Train RMSE: {np.sqrt(-rdg_val_scores['train_neg_mean_squared_error']).mean()}
+  Train RMSE as hours: {np.sqrt(-rdg_val_scores['train_neg_mean_squared_error']).mean()/3600}
+  Train R2: {rdg_val_scores['train_r2'].mean()}
+  Test RMSE: {np.sqrt(-rdg_val_scores['test_neg_mean_squared_error']).mean()}
+  Test RMSE as hours: {np.sqrt(-rdg_val_scores['test_neg_mean_squared_error']).mean()/3600}
+  Test R2: {rdg_val_scores['test_r2'].mean()}
+  -------------------------------------
+""")
+```
+
+### Predictions
+
+```{python}
+# function to enter new data and get predicted finishing time back
+# from Ridge Regression	model in human readable format
+def rdg_predict_new_runner(age, gender, nat, distance, elevation_gain, elevation_loss, aid_stations, participants, city):
+	# create a dataframe with a single row and the same feature column names,
+	# but populated only by zeroes
+	base = pd.DataFrame(np.zeros((1, len(X_train.columns)), dtype=np.int64), columns=X_train.columns)
+
+	# set the values of the dataframe columns to the input values
+	base.runner_age = age
+	base.runner_gender = gender
+	base.distance = distance
+	base.elevation_gain = elevation_gain
+	base.elevation_loss = elevation_loss
+	base.aid_stations = aid_stations
+	base.participants = participants
+	# check if the given nationality and city are already in the
+	# feature cols and encode if so, otherwise skip
+	nat_col = "runner_nationality_" + nat
+	if (nat_col in base.columns):
+		base[nat_col] = 1
+	city_col = "city_" + city
+	if (city_col in base.columns):
+		base[city_col] = 1
+
+	# feed the new data to the model
+	s = float(rdg.predict(base))
+
+	# assign a label to the gender data for nicer printing
+	if (gender == 0): 
+		gender_label = 'male'
+	else:
+		gender_label = 'female'
+
+	# workout total elevation change
+	if ((elevation_gain - elevation_loss) > 0): 
+		elevation_label = 'gain'
+	else:
+		elevation_label = 'loss'
+
+	print(f"""
+	----- Predicted Outcome -----
+	For a {age} year old {gender_label} from {nat}, running a {distance} km race in {city}
+	with an elevation {elevation_label} of {abs(elevation_gain - elevation_loss)} ft, {participants} other runners, and {aid_stations} aid stations.
+	
+	Predicted finishing time: {pd.to_timedelta(s, unit='s')}
+	-----------------------------
+	""")
+
+  # enter new data for a prediction from Ridge model
+rdg_predict_new_runner(20, 0, "GBR", 155, 1000, 400, 10, 100, "Zagreb")
+```
+:::
+
+# Wrapping up
+
+## Conclusion
+
+- Yes, you can predict an ultra marathon finishing time for a given athlete profile, in a given race
+- The model accounts for ~74% of the variability in a finishing time
+- But with an RMSE of ~5 hours, may not be particularly useful for elite athletes
+
+## If I had more time...
+
+- Investigated multi-collinearity within the dataset
+- Further investigated scikit pipelines for other steps such as regularisation
+- Investigated other regression models, such as ElasticNet
+- Used classification methods to work with 'DNF' data to classify if an athlete will even finish a given race
+
+# Thank you for listening!
