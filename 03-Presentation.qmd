@@ -1,6 +1,6 @@
 ---
 title: "Predicting Ultra Marathon Times"
-subtitle: "DS49 Final Project"
+subtitle: "Final Project"
 author: "James Adams"
 filters:
   - _resources/scripts/shortcodes.lua
@@ -586,4 +586,4 @@ rdg_predict_new_runner(20, 0, "GBR", 155, 1000, 400, 10, 100, "Zagreb")
 - Investigated other regression models, such as ElasticNet
 - Used classification methods to work with 'DNF' data to classify if an athlete will even finish a given race
 
-# Thank you for listening!
+# Thank you!
