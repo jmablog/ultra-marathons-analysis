@@ -1,6 +1,6 @@
 ---
 title: "Problem Statement"
-subtitle: "DS49 Final Project"
+subtitle: "Final Project"
 filters:
   - _resources/scripts/shortcodes.lua
 standalone: true
